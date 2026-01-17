@@ -22,8 +22,6 @@ from gotennet.models.components.layers import (
     CosineCutoff,
     Dense,
     Distance,
-    EdgeInit,
-    NodeInit,
     TensorLayerNorm,
     get_weight_init_by_string,
     str2act,
@@ -659,6 +657,186 @@ class GATA(MessagePassing):
         return inputs
 
 
+class PairFWLGATA(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_rbf: int,
+        lmax: int,
+        activation: Callable,
+        weight_init: Callable = nn.init.xavier_uniform_,
+        bias_init: Callable = nn.init.zeros_,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.lmax = lmax
+        self.last_attn = None
+
+        InitDense = partial(Dense, weight_init=weight_init, bias_init=bias_init)
+        self.W_q = InitDense(hidden_dim, hidden_dim, activation=None)
+        self.k_mlp = MLP(
+            [2 * hidden_dim, hidden_dim, hidden_dim],
+            activation=activation,
+            norm="",
+            weight_init=weight_init,
+            bias_init=bias_init,
+            last_activation=None,
+        )
+        self.v_mlp = MLP(
+            [2 * hidden_dim, hidden_dim, hidden_dim],
+            activation=activation,
+            norm="",
+            weight_init=weight_init,
+            bias_init=bias_init,
+            last_activation=None,
+        )
+        g_in = 2 * n_rbf + 2
+        self.g_mlp = MLP(
+            [g_in, hidden_dim, hidden_dim],
+            activation=activation,
+            norm="",
+            weight_init=weight_init,
+            bias_init=bias_init,
+            last_activation=None,
+        )
+        self.Wre = InitDense(hidden_dim, hidden_dim, activation=None)
+        self.Wrs = InitDense(hidden_dim, hidden_dim, activation=None)
+        self.s_mlp = MLP(
+            [2 * hidden_dim, hidden_dim, hidden_dim],
+            activation=activation,
+            norm="",
+            weight_init=weight_init,
+            bias_init=bias_init,
+            last_activation=None,
+        )
+        self.proj_out = InitDense(hidden_dim, (1 + 4 * lmax) * hidden_dim, activation=None)
+
+    def reset_parameters(self) -> None:
+        self.W_q.reset_parameters()
+        self.k_mlp.reset_parameters()
+        self.v_mlp.reset_parameters()
+        self.g_mlp.reset_parameters()
+        self.Wre.reset_parameters()
+        self.Wrs.reset_parameters()
+        self.s_mlp.reset_parameters()
+        self.proj_out.reset_parameters()
+
+    def forward(
+        self,
+        h_e: Tensor,
+        X_e: List[Tensor],
+        t_e: Tensor,
+        r0: Tensor,
+        r_list: List[Tensor],
+        w_tgt: Tensor,
+        w_it: Tensor,
+        w_tj: Tensor,
+    ) -> Tuple[Tensor, List[Tensor]]:
+        if w_tgt.numel() == 0:
+            self.last_attn = w_tgt.new_empty((0,), dtype=h_e.dtype)
+            return h_e, X_e
+
+        h_tgt = h_e[w_tgt]
+        h_it = h_e[w_it]
+        h_tj = h_e[w_tj]
+        h_pair = torch.cat([h_it, h_tj], dim=-1)
+
+        q = self.W_q(h_tgt)
+        k = self.k_mlp(h_pair)
+        v = self.v_mlp(h_pair)
+
+        t_it = t_e[w_it]
+        t_tj = t_e[w_tj]
+        r0_it = r0[w_it]
+        r0_tj = r0[w_tj]
+        g = self.g_mlp(torch.cat([t_it, t_tj, r0_it, r0_tj], dim=-1))
+        gate_k = torch.sigmoid(self.Wre(g))
+
+        alpha = torch.sum(q * (k * gate_k), dim=-1)
+        attn = softmax(alpha, index=w_tgt)
+        self.last_attn = attn
+        sea = attn.unsqueeze(-1) * v
+
+        split_in = sea + (self.Wrs(g) * self.s_mlp(h_pair))
+        packed = self.proj_out(split_in)
+
+        split_chunks = torch.split(packed, self.hidden_dim, dim=-1)
+        o_s = split_chunks[0]
+        offset = 1
+        o_d = []
+        o_dbar = []
+        o_t = []
+        o_tbar = []
+        for _ in range(self.lmax):
+            o_d.append(split_chunks[offset])
+            o_dbar.append(split_chunks[offset + 1])
+            o_t.append(split_chunks[offset + 2])
+            o_tbar.append(split_chunks[offset + 3])
+            offset += 4
+
+        delta_h = scatter(o_s, w_tgt, dim=0, dim_size=h_e.size(0), reduce="sum")
+        h_e = h_e + delta_h
+
+        X_out = []
+        for l in range(self.lmax):
+            r_it = r_list[l][w_it]
+            r_tj = r_list[l][w_tj]
+            X_it = X_e[l][w_it]
+            X_tj = X_e[l][w_tj]
+            msg_l = (
+                o_d[l].unsqueeze(1) * r_it.unsqueeze(-1)
+                + o_dbar[l].unsqueeze(1) * r_tj.unsqueeze(-1)
+                + o_t[l].unsqueeze(1) * X_it
+                + o_tbar[l].unsqueeze(1) * X_tj
+            )
+            delta_X = scatter(msg_l, w_tgt, dim=0, dim_size=h_e.size(0), reduce="sum")
+            X_out.append(X_e[l] + delta_X)
+
+        return h_e, X_out
+
+
+def build_wedge_index(edge_index: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    edge_index_cpu = edge_index.cpu()
+    num_edges = edge_index_cpu.size(1)
+    if num_edges == 0:
+        empty = edge_index.new_empty((0,), dtype=torch.long)
+        return empty, empty, empty
+
+    num_nodes = int(edge_index_cpu.max().item()) + 1
+    src_list = edge_index_cpu[0].tolist()
+    dst_list = edge_index_cpu[1].tolist()
+
+    edge_map = {}
+    outgoing = [[] for _ in range(num_nodes)]
+    incoming = [[] for _ in range(num_nodes)]
+    for eid, (src, dst) in enumerate(zip(src_list, dst_list)):
+        edge_map[(src, dst)] = eid
+        outgoing[src].append((dst, eid))
+        incoming[dst].append((src, eid))
+
+    w_tgt = []
+    w_it = []
+    w_tj = []
+    for t in range(num_nodes):
+        for i, e_it in incoming[t]:
+            for j, e_tj in outgoing[t]:
+                e_tgt = edge_map.get((i, j))
+                if e_tgt is not None:
+                    w_tgt.append(e_tgt)
+                    w_it.append(e_it)
+                    w_tj.append(e_tj)
+
+    device = edge_index.device
+    if len(w_tgt) == 0:
+        empty = edge_index.new_empty((0,), dtype=torch.long)
+        return empty, empty, empty
+    return (
+        torch.tensor(w_tgt, device=device, dtype=torch.long),
+        torch.tensor(w_it, device=device, dtype=torch.long),
+        torch.tensor(w_tj, device=device, dtype=torch.long),
+    )
+
+
 class EQFF(nn.Module):
     """
     Equivariant Feed-Forward (EQFF) Network for mixing atom features.
@@ -841,61 +1019,31 @@ class GotenNet(nn.Module):
         self.cutoff = cutoff_fn.cutoff
         self.lmax = lmax
 
-        self.node_init = NodeInit(
-            [self.hidden_dim, self.hidden_dim],
-            n_rbf,
-            self.cutoff,
-            max_z=max_z,
-            weight_init=weight_init,
-            bias_init=bias_init,
-            proj_ln="layer",
-            activation=activation,
-        )
-
-        self.edge_init = EdgeInit(n_rbf, self.hidden_dim)
-
         radial_basis = str2basis(radial_basis)
         self.radial_basis = radial_basis(cutoff=self.cutoff, n_rbf=n_rbf)
-        self.A_na = nn.Embedding(max_z, n_atom_basis, padding_idx=0)
         self.sh_irreps = e3nn.o3.Irreps.spherical_harmonics(lmax)
         self.sphere = e3nn.o3.SphericalHarmonics(self.sh_irreps, normalize=False, normalization="norm")
 
-        self.gata_list = nn.ModuleList(
-            [
-                GATA(
-                    n_atom_basis=self.n_atom_basis,
-                    activation=activation,
-                    aggr=aggr,
-                    weight_init=weight_init,
-                    bias_init=bias_init,
-                    layer_norm=layernorm,
-                    steerable_norm=steerable_norm,
-                    cutoff=self.cutoff,
-                    epsilon=epsilon,
-                    num_heads=num_heads,
-                    dropout=attn_dropout,
-                    edge_updates=edge_updates,
-                    last_layer=(i == self.n_interactions - 1),
-                    scale_edge=scale_edge,
-                    evec_dim=evec_dim,
-                    emlp_dim=emlp_dim,
-                    sep_htr=sep_htr,
-                    sep_dir=sep_dir,
-                    sep_tensor=sep_tensor,
-                    lmax=lmax,
-                    edge_ln=edge_ln,
-                )
-                for i in range(self.n_interactions)
-            ]
+        self.edge_phi = MLP(
+            [n_rbf, self.hidden_dim, self.hidden_dim],
+            activation=activation,
+            norm="",
+            weight_init=weight_init,
+            bias_init=bias_init,
+            last_activation=None,
+        )
+        InitDense = partial(Dense, weight_init=weight_init, bias_init=bias_init)
+        self.gamma_init = nn.ModuleList(
+            [InitDense(self.hidden_dim, self.hidden_dim, activation=None) for _ in range(1, lmax + 1)]
         )
 
-        self.eqff_list = nn.ModuleList(
+        self.pair_gata_list = nn.ModuleList(
             [
-                EQFF(
-                    n_atom_basis=self.n_atom_basis,
-                    activation=activation,
+                PairFWLGATA(
+                    hidden_dim=self.hidden_dim,
+                    n_rbf=n_rbf,
                     lmax=lmax,
-                    epsilon=epsilon,
+                    activation=activation,
                     weight_init=weight_init,
                     bias_init=bias_init,
                 )
@@ -950,11 +1098,10 @@ class GotenNet(nn.Module):
         return gotennet
 
     def reset_parameters(self):
-        self.node_init.reset_parameters()
-        self.edge_init.reset_parameters()
-        for l in self.gata_list:
-            l.reset_parameters()
-        for l in self.eqff_list:
+        self.edge_phi.reset_parameters()
+        for layer in self.gamma_init:
+            layer.reset_parameters()
+        for l in self.pair_gata_list:
             l.reset_parameters()
 
     def forward(
@@ -974,44 +1121,48 @@ class GotenNet(nn.Module):
                 - Atomic representation [num_nodes, hidden_dims]
                 - High-degree steerable features [num_nodes, (L_max ** 2) - 1, hidden_dims]
         """
-        h = self.A_na(atomic_numbers)[:]
-        phi_r0_ij = self.radial_basis(edge_diff)
-
-        h = self.node_init(atomic_numbers, h, edge_index, edge_diff, phi_r0_ij)
-        t_ij_init = self.edge_init(edge_index, phi_r0_ij, h)
-        mask = edge_index[0] != edge_index[1]
-        r0_ij = torch.norm(edge_vec[mask], dim=1).unsqueeze(1)
-        edge_vec[mask] = edge_vec[mask] / r0_ij
-
-        rl_ij = self.sphere(edge_vec)[:, 1:]
-
-        equi_dim = ((self.lmax + 1) ** 2) - 1
-        # count number of edges for each node
-        num_edges = scatter(
-            torch.ones_like(edge_diff), edge_index[0], dim=0, reduce="sum"
+        _, _, h_node, X_node_list = self.forward_pair_states(
+            atomic_numbers, edge_index, edge_diff, edge_vec
         )
-        n_edges = num_edges[edge_index[0]]
+        if X_node_list:
+            X_node = torch.cat(X_node_list, dim=1)
+        else:
+            X_node = edge_index.new_empty((h_node.size(0), 0, self.hidden_dim))
+        return h_node, X_node
 
-        hs = h.shape
-        X = torch.zeros((hs[0], equi_dim, hs[1]), device=h.device)
-        h.unsqueeze_(1)
-        t_ij = t_ij_init
-        for _i, (gata, eqff) in enumerate(
-            zip(self.gata_list, self.eqff_list, strict=False)
-        ):
-            h, X, t_ij = gata(
-                edge_index,
-                h,
-                X,
-                rl_ij=rl_ij,
-                t_ij=t_ij,
-                r_ij=edge_diff,
-                n_edges=n_edges,
-            )  # idx_i, idx_j, n_atoms, # , f_ij=f_ij
-            h, X = eqff(h, X)
+    def forward_pair_states(
+        self, atomic_numbers: Tensor, edge_index: Tensor, edge_diff: Tensor, edge_vec: Tensor
+    ) -> Tuple[Tensor, List[Tensor], Tensor, List[Tensor]]:
+        t_e = self.radial_basis(edge_diff)
+        h_e = self.edge_phi(t_e)
 
-        h = h.squeeze(1)
-        return h, X
+        edge_vec = edge_vec.clone()
+        mask = edge_index[0] != edge_index[1]
+        if mask.any():
+            r0_ij = torch.norm(edge_vec[mask], dim=1).unsqueeze(1)
+            edge_vec[mask] = edge_vec[mask] / r0_ij
+
+        r_all = self.sphere(edge_vec)
+        r0 = r_all[:, :1]
+        r_list = split_to_components(r_all[:, 1:], self.lmax, start=1, dim=-1)
+
+        X_e = []
+        for l in range(self.lmax):
+            gamma = self.gamma_init[l](h_e)
+            X_e.append(gamma.unsqueeze(1) * r_list[l].unsqueeze(-1))
+
+        w_tgt, w_it, w_tj = build_wedge_index(edge_index)
+        for layer in self.pair_gata_list:
+            h_e, X_e = layer(h_e, X_e, t_e, r0, r_list, w_tgt, w_it, w_tj)
+
+        num_nodes = atomic_numbers.size(0)
+        col = edge_index[1]
+        h_node = scatter(h_e, col, dim=0, dim_size=num_nodes, reduce="sum")
+        X_node_list = [
+            scatter(X_e[l], col, dim=0, dim_size=num_nodes, reduce="sum")
+            for l in range(self.lmax)
+        ]
+        return h_e, X_e, h_node, X_node_list
 
 
 class GotenNetWrapper(GotenNet):
