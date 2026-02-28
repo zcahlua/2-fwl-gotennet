@@ -1,1049 +1,435 @@
-# Standard library imports
-import os
-from functools import partial
-from typing import Callable, List, Mapping, Optional, Tuple, Union
+from __future__ import annotations
+
+from typing import Mapping, Optional, Tuple, Union
 
 import e3nn.o3
-
-# Related third-party imports
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch_geometric.nn import MessagePassing
-from torch_geometric.typing import OptTensor
-from torch_geometric.utils import scatter, softmax
+from torch_geometric.utils import scatter
 
-# Local application/library specific imports
-import gotennet.utils as utils
 from gotennet.models.components.layers import (
-    MLP,
     CosineCutoff,
     Dense,
     Distance,
     EdgeInit,
     NodeInit,
-    TensorLayerNorm,
-    get_weight_init_by_string,
     str2act,
     str2basis,
 )
 
-log = utils.get_logger(__name__)
 
-# num_nodes and hidden_dims are placeholder values, will be overwritten by actual data
-num_nodes = hidden_dims = 1
+def build_two_hop_edges(
+    edge_index1: Tensor,
+    num_nodes: int,
+    batch: Optional[Tensor] = None,
+    pos: Optional[Tensor] = None,
+    r2: Optional[float] = None,
+    topk2: Optional[int] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    src1, dst1 = edge_index1
+    device = edge_index1.device
+    key_base = num_nodes
+
+    e1_keys = src1 * key_base + dst1
+    extra_pairs = []
+
+    incoming = [[] for _ in range(num_nodes)]
+    outgoing = [[] for _ in range(num_nodes)]
+    for e in range(src1.numel()):
+        i = int(src1[e])
+        j = int(dst1[e])
+        if i == j:
+            continue
+        outgoing[i].append(j)
+        incoming[j].append(i)
+
+    for k in range(num_nodes):
+        in_nodes = incoming[k]
+        out_nodes = outgoing[k]
+        if not in_nodes or not out_nodes:
+            continue
+        in_t = torch.tensor(in_nodes, device=device, dtype=torch.long)
+        out_t = torch.tensor(out_nodes, device=device, dtype=torch.long)
+        ii = in_t.repeat_interleave(out_t.numel())
+        jj = out_t.repeat(in_t.numel())
+        mask = ii != jj
+        if mask.any():
+            extra_pairs.append(torch.stack([ii[mask], jj[mask]], dim=0))
+
+    if extra_pairs:
+        extra = torch.cat(extra_pairs, dim=1)
+        e2 = torch.cat([edge_index1, extra], dim=1)
+    else:
+        e2 = edge_index1.clone()
+
+    self_mask = e2[0] != e2[1]
+    e2 = e2[:, self_mask]
+
+    keys = e2[0] * key_base + e2[1]
+    uniq_keys = torch.unique(keys, sorted=True)
+    src2 = torch.div(uniq_keys, key_base, rounding_mode="floor")
+    dst2 = uniq_keys - src2 * key_base
+    edge_index2 = torch.stack([src2, dst2], dim=0)
+
+    if batch is not None:
+        same_graph = batch[edge_index2[0]] == batch[edge_index2[1]]
+        edge_index2 = edge_index2[:, same_graph]
+        uniq_keys = uniq_keys[same_graph]
+
+    if pos is not None and (r2 is not None or topk2 is not None):
+        d2 = torch.norm(pos[edge_index2[0]] - pos[edge_index2[1]], dim=-1)
+        keep = torch.ones_like(d2, dtype=torch.bool)
+        if r2 is not None:
+            keep &= d2 <= r2
+        if topk2 is not None:
+            keep_topk = torch.zeros_like(keep)
+            for i in range(num_nodes):
+                node_mask = edge_index2[0] == i
+                if batch is not None:
+                    node_mask &= batch[edge_index2[0]] == batch[i]
+                idx = torch.where(node_mask)[0]
+                if idx.numel() == 0:
+                    continue
+                d = d2[idx]
+                k = min(topk2, idx.numel())
+                top_idx = torch.topk(d, k=k, largest=False).indices
+                keep_topk[idx[top_idx]] = True
+            keep &= keep_topk
+        edge_index2 = edge_index2[:, keep]
+        uniq_keys = uniq_keys[keep]
+
+    e1_keys_sorted = src1 * key_base + dst1
+    pos_in_e2 = torch.searchsorted(uniq_keys, e1_keys_sorted)
+    valid = (pos_in_e2 < uniq_keys.numel()) & (uniq_keys[pos_in_e2] == e1_keys_sorted)
+    e1_to_e2 = pos_in_e2
+    if not bool(valid.all()):
+        raise RuntimeError("Failed to align E1 edges in E2.")
+
+    edge_type2 = torch.ones(edge_index2.size(1), device=device, dtype=torch.long)
+    edge_type2[e1_to_e2] = 0
+    return edge_index2, edge_type2, e1_to_e2
 
 
-def get_split_sizes_from_lmax(lmax: int, start: int = 1) -> List[int]:
-    """
-    Return split sizes for torch.split based on lmax.
-
-    This function calculates the dimensions of spherical harmonic components
-    for each angular momentum value from start to lmax.
-
-    Args:
-        lmax: Maximum angular momentum value
-        start: Starting angular momentum value (default: 1)
-
-    Returns:
-        List of split sizes for torch.split (sizes of spherical harmonic components)
-    """
-    return [2 * l + 1 for l in range(start, lmax + 1)]
-
-
-def split_to_components(
-    tensor: Tensor, lmax: int, start: int = 1, dim: int = -1
-) -> List[Tensor]:
-    """
-    Split a tensor into its spherical harmonic components.
-
-    This function splits a tensor containing concatenated spherical harmonic components
-    into a list of separate tensors, each corresponding to a specific angular momentum.
-
-    Args:
-        tensor: The tensor to split [*, sum(2l+1 for l in range(start, lmax+1)), *]
-        lmax: Maximum angular momentum value
-        start: Starting angular momentum value (default: 1)
-        dim: The dimension to split along (default: -1)
-
-    Returns:
-        List of tensors, each representing a spherical harmonic component
-    """
-    split_sizes = get_split_sizes_from_lmax(lmax, start=start)
-    components = torch.split(tensor, split_sizes, dim=dim)
-    return components
-
-
-class GATA(MessagePassing):
-    def __init__(
-        self,
-        n_atom_basis: int,
-        activation: Callable,
-        weight_init: Callable = nn.init.xavier_uniform_,
-        bias_init: Callable = nn.init.zeros_,
-        aggr: str = "add",
-        node_dim: int = 0,
-        epsilon: float = 1e-7,
-        layer_norm: str = "",
-        steerable_norm: str = "",
-        cutoff: float = 5.0,
-        num_heads: int = 8,
-        dropout: float = 0.0,
-        edge_updates: Union[bool, str] = True,
-        last_layer: bool = False,
-        scale_edge: bool = True,
-        evec_dim: Optional[int] = None,
-        emlp_dim: Optional[int] = None,
-        sep_htr: bool = True,
-        sep_dir: bool = True,
-        sep_tensor: bool = True,
-        lmax: int = 2,
-        edge_ln: str = "",
-    ):
-        """
-        Graph Attention Transformer Architecture.
-
-        Args:
-            n_atom_basis: Number of features to describe atomic environments.
-            activation: Activation function to be used. If None, no activation function is used.
-            weight_init: Weight initialization function.
-            bias_init: Bias initialization function.
-            aggr: Aggregation method ('add', 'mean' or 'max').
-            node_dim: The axis along which to aggregate.
-            epsilon: Small constant for numerical stability.
-            layer_norm: Type of layer normalization to use.
-            steerable_norm: Type of steerable normalization to use.
-            cutoff: Cutoff distance for interactions.
-            num_heads: Number of attention heads.
-            dropout: Dropout probability.
-            edge_updates: Whether to update edge features.
-            last_layer: Whether this is the last layer.
-            scale_edge: Whether to scale edge features.
-            evec_dim: Dimension of edge vector features.
-            emlp_dim: Dimension of edge MLP features.
-            sep_htr: Whether to separate vector features.
-            sep_dir: Whether to separate direction features.
-            sep_tensor: Whether to separate tensor features.
-            lmax: Maximum angular momentum.
-        """
-        super(GATA, self).__init__(aggr=aggr, node_dim=node_dim)
-        self.sep_htr = sep_htr
-        self.epsilon = epsilon
-        self.last_layer = last_layer
-        self.edge_updates = edge_updates
-        self.scale_edge = scale_edge
-        self.activation = activation
-        self.sep_dir = sep_dir
-        self.sep_tensor = sep_tensor
-
-        # Parse edge update configuration
-        update_info = {
-            "gated": False,
-            "rej": True,
-            "mlp": False,
-            "mlpa": False,
-            "lin_w": 0,
-            "lin_ln": 0,
-        }
-
-        update_parts = edge_updates.split("_") if isinstance(edge_updates, str) else []
-        allowed_parts = [
-            "gated",
-            "gatedt",
-            "norej",
-            "norm",
-            "mlp",
-            "mlpa",
-            "act",
-            "linw",
-            "linwa",
-            "ln",
-            "postln",
-        ]
-
-        if not all([part in allowed_parts for part in update_parts]):
-            raise ValueError(
-                f"Invalid edge update parts. Allowed parts are {allowed_parts}"
-            )
-
-        if "gated" in update_parts:
-            update_info["gated"] = "gated"
-        if "gatedt" in update_parts:
-            update_info["gated"] = "gatedt"
-        if "act" in update_parts:
-            update_info["gated"] = "act"
-        if "norej" in update_parts:
-            update_info["rej"] = False
-        if "mlp" in update_parts:
-            update_info["mlp"] = True
-        if "mlpa" in update_parts:
-            update_info["mlpa"] = True
-        if "linw" in update_parts:
-            update_info["lin_w"] = 1
-        if "linwa" in update_parts:
-            update_info["lin_w"] = 2
-        if "ln" in update_parts:
-            update_info["lin_ln"] = 1
-        if "postln" in update_parts:
-            update_info["lin_ln"] = 2
-
-        self.update_info = update_info
-        log.info(f"Edge updates: {update_info}")
-
-        self.dropout = dropout
-        self.n_atom_basis = n_atom_basis
+class Local2FWLRefine(nn.Module):
+    def __init__(self, hidden_dim: int, n_rbf: int, lmax: int, wedge_use_high_degree: bool = False):
+        super().__init__()
+        self.hidden_dim = hidden_dim
         self.lmax = lmax
-
-        # Calculate multiplier based on configuration
-        multiplier = 3
-        if self.sep_dir:
-            multiplier += lmax - 1
-        if self.sep_tensor:
-            multiplier += lmax - 1
-        self.multiplier = multiplier
-
-        # Initialize layers
-        InitDense = partial(Dense, weight_init=weight_init, bias_init=bias_init)
-
-        # Implementation of gamma_s function
-        self.gamma_s = nn.Sequential(
-            InitDense(n_atom_basis, n_atom_basis, activation=activation),
-            InitDense(n_atom_basis, multiplier * n_atom_basis, activation=None),
-        )
-
-        self.num_heads = num_heads
-
-        # Query and key transformations
-        self.W_q = InitDense(n_atom_basis, n_atom_basis, activation=None)
-        self.W_k = InitDense(n_atom_basis, n_atom_basis, activation=None)
-
-        # Value transformation
-        self.gamma_v = nn.Sequential(
-            InitDense(n_atom_basis, n_atom_basis, activation=activation),
-            InitDense(n_atom_basis, multiplier * n_atom_basis, activation=None),
-        )
-
-        # Edge feature transformations
-        self.W_re = InitDense(
-            n_atom_basis,
-            n_atom_basis,
-            activation=activation,
-        )
-
-        # Initialize MLP for edge updates
-        InitMLP = partial(MLP, weight_init=weight_init, bias_init=bias_init)
-
-        self.edge_vec_dim = n_atom_basis if evec_dim is None else evec_dim
-        self.edge_mlp_dim = n_atom_basis if emlp_dim is None else emlp_dim
-
-        if not self.last_layer and self.edge_updates:
-            if self.update_info["mlp"] or self.update_info["mlpa"]:
-                dims = [n_atom_basis, self.edge_mlp_dim, n_atom_basis]
-            else:
-                dims = [n_atom_basis, n_atom_basis]
-
-            self.gamma_t = InitMLP(
-                dims,
-                activation=activation,
-                last_activation=None if self.update_info["mlp"] else self.activation,
-                norm=edge_ln,
-            )
-
-            self.W_vq = InitDense(
-                n_atom_basis, self.edge_vec_dim, activation=None, bias=False
-            )
-
-            if self.sep_htr:
-                self.W_vk = nn.ModuleList(
-                    [
-                        InitDense(
-                            n_atom_basis, self.edge_vec_dim, activation=None, bias=False
-                        )
-                        for _i in range(self.lmax)
-                    ]
-                )
-            else:
-                self.W_vk = InitDense(
-                    n_atom_basis, self.edge_vec_dim, activation=None, bias=False
-                )
-
-            modules = []
-            if self.update_info["lin_w"] > 0:
-                if self.update_info["lin_ln"] == 1:
-                    modules.append(nn.LayerNorm(self.edge_vec_dim))
-                if self.update_info["lin_w"] % 10 == 2:
-                    modules.append(self.activation)
-
-                self.W_edp = InitDense(
-                    self.edge_vec_dim,
-                    n_atom_basis,
-                    activation=None,
-                    norm="layer" if self.update_info["lin_ln"] == 2 else "",
-                )
-
-                modules.append(self.W_edp)
-
-            if self.update_info["gated"] == "gatedt":
-                modules.append(nn.Tanh())
-            elif self.update_info["gated"] == "gated":
-                modules.append(nn.Sigmoid())
-            elif self.update_info["gated"] == "act":
-                modules.append(nn.SiLU())
-            self.gamma_w = nn.Sequential(*modules)
-
-        # Cutoff function
-        self.cutoff = CosineCutoff(cutoff)
-        self._alpha = None
-
-        # Spatial filter
-        self.W_rs = InitDense(
-            n_atom_basis,
-            n_atom_basis * self.multiplier,
-            activation=None,
-        )
-
-        # Normalization layers
-        self.layernorm_ = layer_norm
-        self.steerable_norm_ = steerable_norm
-        self.layernorm = (
-            nn.LayerNorm(n_atom_basis) if layer_norm != "" else nn.Identity()
-        )
-        self.tensor_layernorm = (
-            TensorLayerNorm(n_atom_basis, trainable=False, lmax=self.lmax)
-            if steerable_norm != ""
-            else nn.Identity()
-        )
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        """Reset all learnable parameters of the module."""
-        if self.layernorm_:
-            self.layernorm.reset_parameters()
-
-        if self.steerable_norm_:
-            self.tensor_layernorm.reset_parameters()
-
-        for l in self.gamma_s:
-            l.reset_parameters()
-
-        self.W_q.reset_parameters()
-        self.W_k.reset_parameters()
-
-        for l in self.gamma_v:
-            l.reset_parameters()
-
-        self.W_rs.reset_parameters()
-
-        if not self.last_layer and self.edge_updates:
-            self.gamma_t.reset_parameters()
-            self.W_vq.reset_parameters()
-
-            if self.sep_htr:
-                for w in self.W_vk:
-                    w.reset_parameters()
-            else:
-                self.W_vk.reset_parameters()
-
-            if self.update_info["lin_w"] > 0:
-                self.W_edp.reset_parameters()
-
-    @staticmethod
-    def vector_rejection(rep: Tensor, rl_ij: Tensor) -> Tensor:
-        """
-        Compute the vector rejection of vec onto rl_ij.
-
-        Args:
-            rep: Input tensor representation [num_edges, (L_max ** 2) - 1, hidden_dims]
-            rl_ij: High-degree steerable feature tensor [num_edges, (L_max ** 2) - 1, 1]
-
-        Returns:
-            The component of vec orthogonal to rl_ij
-        """
-        vec_proj = (rep * rl_ij.unsqueeze(2)).sum(dim=1, keepdim=True)
-        return rep - vec_proj * rl_ij.unsqueeze(2)
+        self.wedge_use_high_degree = wedge_use_high_degree
+        cdim = lmax if wedge_use_high_degree else 1
+        wedge_feat_dim = (3 * n_rbf) + cdim
+        in_dim = hidden_dim * 6 + wedge_feat_dim
+        self.rho = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.gamma_w = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
+        self.gamma_t = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh())
 
     def forward(
         self,
-        edge_index: Tensor,
+        t_e2: Tensor,
         h: Tensor,
-        X: Tensor,
-        rl_ij: Tensor,
-        t_ij: Tensor,
-        r_ij: Tensor,
-        n_edges: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Compute interaction output for the GATA layer.
-
-        This method processes node and edge features through the attention mechanism
-        and updates both scalar and high-degree steerable features.
-
-        Args:
-            edge_index: Tensor describing graph connectivity [2, num_edges]
-            h: Scalar input values [num_nodes, 1, hidden_dims]
-            X: High-degree steerable features [num_nodes, (L_max ** 2) - 1, hidden_dims]
-            rl_ij: Edge tensor representation [num_nodes, (L_max ** 2) - 1, 1]
-            t_ij: Edge scalar features [num_nodes, 1, hidden_dims]
-            r_ij: Edge scalar distance [num_nodes, 1]
-            n_edges: Number of edges per node [num_edges, 1]
-
-        Returns:
-            Tuple containing:
-                - Updated scalar values [num_nodes, 1, hidden_dims]
-                - Updated high-degree steerable features [num_nodes, (L_max ** 2) - 1, hidden_dims]
-                - Updated edge features [num_edges, 1, hidden_dims]
-        """
-        h = self.layernorm(h)
-        X = self.tensor_layernorm(X)
-
-        q = self.W_q(h).reshape(-1, self.num_heads, self.n_atom_basis // self.num_heads)
-        k = self.W_k(h).reshape(-1, self.num_heads, self.n_atom_basis // self.num_heads)
-
-        # inter-atomic
-        x = self.gamma_s(h)
-        v = self.gamma_v(h)
-        t_ij_attn = self.W_re(t_ij)
-        t_ij_filter = self.W_rs(t_ij)
-
-        # propagate_type: (x: Tensor, q:Tensor, k:Tensor, v:Tensor, X: Tensor,
-        #                  t_ij_filter: Tensor, t_ij_attn: Tensor, r_ij: Tensor,
-        #                  rl_ij: Tensor, n_edges: Tensor)
-        d_h, d_X = self.propagate(
-            edge_index=edge_index,
-            x=x,
-            q=q,
-            k=k,
-            v=v,
-            X=X,
-            t_ij_filter=t_ij_filter,
-            t_ij_attn=t_ij_attn,
-            r_ij=r_ij,
-            rl_ij=rl_ij,
-            n_edges=n_edges,
-        )
-
-        h = h + d_h
-        X = X + d_X
-
-        if not self.last_layer and self.edge_updates:
-            X_htr = X
-
-            EQ = self.W_vq(X_htr)
-            if self.sep_htr:
-                X_split = torch.split(
-                    X_htr, get_split_sizes_from_lmax(self.lmax), dim=1
-                )
-                EK = torch.concat(
-                    [w(X_split[i]) for i, w in enumerate(self.W_vk)], dim=1
-                )
-            else:
-                EK = self.W_vk(X_htr)
-
-            # edge_updater_type: (EQ: Tensor, EK:Tensor, rl_ij: Tensor, t_ij: Tensor)
-            dt_ij = self.edge_updater(edge_index, EQ=EQ, EK=EK, rl_ij=rl_ij, t_ij=t_ij)
-            t_ij = t_ij + dt_ij
-            self._alpha = None
-            return h, X, t_ij
-
-        self._alpha = None
-        return h, X, t_ij
-
-    def message(
-        self,
-        edge_index: Tensor,
-        x_j: Tensor,
-        q_i: Tensor,
-        k_j: Tensor,
-        v_j: Tensor,
-        X_j: Tensor,
-        t_ij_filter: Tensor,
-        t_ij_attn: Tensor,
-        r_ij: Tensor,
-        rl_ij: Tensor,
-        n_edges: Tensor,
-        index: Tensor,
-        ptr: OptTensor,
-        dim_size: Optional[int],
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        Compute messages from source nodes to target nodes.
-
-        This method implements the message passing mechanism for the GATA layer,
-        combining attention-based and spatial filtering approaches.
-
-        Args:
-            edge_index: Edge connectivity tensor [2, num_edges]
-            x_j: Source node features [num_edges, 1, hidden_dims]
-            q_i: Target node query features [num_edges, num_heads, hidden_dims // num_heads]
-            k_j: Source node key features [num_edges, num_heads, hidden_dims // num_heads]
-            v_j: Source node value features [num_edges, num_heads, hidden_dims * multiplier // num_heads]
-            X_j: Source node high-degree steerable features [num_edges, (L_max ** 2) - 1, hidden_dims]
-            t_ij_filter: Edge scalar filter features [num_edges, 1, hidden_dims]
-            t_ij_attn: Edge attention filter features [num_edges, 1, hidden_dims]
-            r_ij: Edge scalar distance [num_edges, 1]
-            rl_ij: Edge tensor representation [num_edges, (L_max ** 2) - 1, 1]
-            n_edges: Number of edges per node [num_edges, 1]
-            index: Index tensor for scatter operation
-            ptr: Pointer tensor for scatter operation
-            dim_size: Dimension size for scatter operation
-
-        Returns:
-            Tuple containing:
-                - Scalar updates dh [num_edges, 1, hidden_dims]
-                - High-degree steerable updates dX [num_edges, (L_max ** 2) - 1, hidden_dims]
-        """
-        # Reshape attention features
-        t_ij_attn = t_ij_attn.reshape(
-            -1, self.num_heads, self.n_atom_basis // self.num_heads
-        )
-
-        # Compute attention scores
-        attn = (q_i * k_j * t_ij_attn).sum(dim=-1, keepdim=True)
-        attn = softmax(attn, index, ptr, dim_size)
-
-        # Normalize the attention scores
-        if self.scale_edge:
-            norm = torch.sqrt(n_edges.reshape(-1, 1, 1)) / np.sqrt(self.n_atom_basis)
-        else:
-            norm = 1.0 / np.sqrt(self.n_atom_basis)
-
-        attn = attn * norm
-        self._alpha = attn
-        attn = F.dropout(attn, p=self.dropout, training=self.training)
-
-        # Apply attention to values
-        sea_ij = attn * v_j.reshape(
-            -1, self.num_heads, (self.n_atom_basis * self.multiplier) // self.num_heads
-        )
-        sea_ij = sea_ij.reshape(-1, 1, self.n_atom_basis * self.multiplier)
-
-        # Apply spatial filter
-        spatial_attn = (
-            t_ij_filter.unsqueeze(1)
-            * x_j
-            * self.cutoff(r_ij.unsqueeze(-1).unsqueeze(-1))
-        )
-
-        # Combine attention and spatial components
-        outputs = spatial_attn + sea_ij
-
-        # Split outputs into components
-        components = torch.split(outputs, self.n_atom_basis, dim=-1)
-
-        o_s_ij = components[0]
-        components = components[1:]
-
-        # Process direction components if enabled
-        if self.sep_dir:
-            o_d_l_ij, components = components[: self.lmax], components[self.lmax :]
-            rl_ij_split = split_to_components(rl_ij[..., None], self.lmax, dim=1)
-            dir_comps = [rl_ij_split[i] * o_d_l_ij[i] for i in range(self.lmax)]
-            dX_R = torch.cat(dir_comps, dim=1)
-        else:
-            o_d_ij, components = components[0], components[1:]
-            dX_R = o_d_ij * rl_ij[..., None]
-
-        # Process tensor components if enabled
-        if self.sep_tensor:
-            o_t_l_ij = components[: self.lmax]
-            X_j_split = split_to_components(X_j, self.lmax, dim=1)
-            tensor_comps = [X_j_split[i] * o_t_l_ij[i] for i in range(self.lmax)]
-            dX_X = torch.cat(tensor_comps, dim=1)
-        else:
-            o_t_ij = components[0]
-            dX_X = o_t_ij * X_j
-
-        # Combine components
-        dX = dX_R + dX_X
-        return o_s_ij, dX
-
-    def edge_update(
-        self, EQ_i: Tensor, EK_j: Tensor, rl_ij: Tensor, t_ij: Tensor
+        edge_index1: Tensor,
+        edge_index2: Tensor,
+        dist_e1: Tensor,
+        dist_e2: Tensor,
+        rbf_e1: Tensor,
+        rbf_e2: Tensor,
+        sph_e1: Tensor,
+        num_nodes: int,
     ) -> Tensor:
-        """
-        Update edge features based on node features.
+        src1, dst1 = edge_index1
+        src2, dst2 = edge_index2
+        device = t_e2.device
 
-        This method computes updates to edge features by combining information from
-        source and target nodes' high-degree steerable features, potentially applying
-        vector rejection.
+        key_base = num_nodes
+        e2_keys = src2 * key_base + dst2
 
-        Args:
-            EQ_i: Source node high-degree steerable features [num_edges, (L_max ** 2) - 1, hidden_dims]
-            EK_j: Target node high-degree steerable features [num_edges, (L_max ** 2) - 1, hidden_dims]
-            rl_ij: Edge tensor representation [num_edges, (L_max ** 2) - 1, 1]
-            t_ij: Edge scalar features [num_edges, 1, hidden_dims]
+        incoming = [[] for _ in range(num_nodes)]
+        outgoing = [[] for _ in range(num_nodes)]
+        in_eid = [[] for _ in range(num_nodes)]
+        out_eid = [[] for _ in range(num_nodes)]
+        for eid in range(src1.numel()):
+            i = int(src1[eid])
+            j = int(dst1[eid])
+            if i == j:
+                continue
+            outgoing[i].append(j)
+            out_eid[i].append(eid)
+            incoming[j].append(i)
+            in_eid[j].append(eid)
 
-        Returns:
-            Updated edge features [num_edges, 1, hidden_dims]
-        """
-        if self.sep_htr:
-            EQ_i_split = split_to_components(EQ_i, self.lmax, dim=1)
-            EK_j_split = split_to_components(EK_j, self.lmax, dim=1)
-            rl_ij_split = split_to_components(rl_ij, self.lmax, dim=1)
+        wedges = []
+        ik_edges = []
+        kj_edges = []
+        for k in range(num_nodes):
+            in_nodes = incoming[k]
+            out_nodes = outgoing[k]
+            if not in_nodes or not out_nodes:
+                continue
+            in_t = torch.tensor(in_nodes, dtype=torch.long, device=device)
+            out_t = torch.tensor(out_nodes, dtype=torch.long, device=device)
+            i_rep = in_t.repeat_interleave(out_t.numel())
+            j_rep = out_t.repeat(in_t.numel())
+            mask = i_rep != j_rep
+            if not mask.any():
+                continue
+            i_rep = i_rep[mask]
+            j_rep = j_rep[mask]
+            k_rep = torch.full_like(i_rep, k)
+            wedges.append(torch.stack([i_rep, k_rep, j_rep], dim=0))
 
-            pairs = []
-            for l in range(len(EQ_i_split)):
-                if self.update_info["rej"]:
-                    EQ_i_l = self.vector_rejection(EQ_i_split[l], rl_ij_split[l])
-                    EK_j_l = self.vector_rejection(EK_j_split[l], -rl_ij_split[l])
-                else:
-                    EQ_i_l = EQ_i_split[l]
-                    EK_j_l = EK_j_split[l]
-                pairs.append((EQ_i_l, EK_j_l))
-        elif not self.update_info["rej"]:
-            pairs = [(EQ_i, EK_j)]
+            in_ids = torch.tensor(in_eid[k], dtype=torch.long, device=device)
+            out_ids = torch.tensor(out_eid[k], dtype=torch.long, device=device)
+            ik = in_ids.repeat_interleave(out_ids.numel())[mask]
+            kj = out_ids.repeat(in_ids.numel())[mask]
+            ik_edges.append(ik)
+            kj_edges.append(kj)
+
+        if not wedges:
+            return t_e2
+
+        wedge = torch.cat(wedges, dim=1)
+        eik = torch.cat(ik_edges)
+        ekj = torch.cat(kj_edges)
+        i, k, j = wedge
+        pair_keys = i * key_base + j
+        eij = torch.searchsorted(e2_keys, pair_keys)
+        valid = (eij < e2_keys.numel()) & (e2_keys[eij] == pair_keys)
+        if not valid.any():
+            return t_e2
+
+        i, k, j, eik, ekj, eij = i[valid], k[valid], j[valid], eik[valid], ekj[valid], eij[valid]
+
+        if self.wedge_use_high_degree and sph_e1.size(-1) >= self.lmax:
+            contractions = []
+            for l in range(1, self.lmax + 1):
+                contractions.append((sph_e1[eik, l] * sph_e1[ekj, l]).unsqueeze(-1))
+            c_feat = torch.cat(contractions, dim=-1)
         else:
-            EQr_i = self.vector_rejection(EQ_i, rl_ij)
-            EKr_j = self.vector_rejection(EK_j, -rl_ij)
-            pairs = [(EQr_i, EKr_j)]
+            c_feat = (sph_e1[eik, 1] * sph_e1[ekj, 1]).unsqueeze(-1)
 
-        # Compute edge weights
-        w_ij = None
-        for el in pairs:
-            EQ_i_l, EK_j_l = el
-            w_l = (EQ_i_l * EK_j_l).sum(dim=1)
-            if w_ij is None:
-                w_ij = w_l
-            else:
-                w_ij = w_ij + w_l
+        g = torch.cat([rbf_e1[eik], rbf_e1[ekj], rbf_e2[eij], c_feat], dim=-1)
+        rho_in = torch.cat(
+            [t_e2[eik], t_e2[ekj], t_e2[eij], h[i], h[k], h[j], g],
+            dim=-1,
+        )
+        wedge_msg = self.rho(rho_in)
+        m = scatter(wedge_msg, eij, dim=0, dim_size=t_e2.size(0), reduce="sum")
+        return t_e2 + self.gamma_w(m) * self.gamma_t(t_e2)
 
-        return self.gamma_t(t_ij) * self.gamma_w(w_ij)
 
-    def aggregate(
-        self,
-        features: Tuple[Tensor, Tensor],
-        index: Tensor,
-        ptr: Optional[Tensor],
-        dim_size: Optional[int],
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        Aggregate messages from source nodes to target nodes.
+class GATA(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.q = nn.Linear(hidden_dim, hidden_dim)
+        self.k = nn.Linear(hidden_dim, hidden_dim)
+        self.v = nn.Linear(hidden_dim, hidden_dim)
+        self.edge_gate = nn.Linear(hidden_dim, num_heads)
+        self.out = nn.Linear(hidden_dim, hidden_dim)
+        self.edge_update = nn.Sequential(nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
 
-        This method implements the aggregation step of message passing, combining
-        messages from neighboring nodes according to the specified aggregation method.
+    def forward(self, edge_index2: Tensor, h: Tensor, t_ij: Tensor) -> Tuple[Tensor, Tensor]:
+        src, dst = edge_index2
+        q = self.q(h[dst]).view(-1, self.num_heads, self.hidden_dim // self.num_heads)
+        k = self.k(h[src]).view(-1, self.num_heads, self.hidden_dim // self.num_heads)
+        v = self.v(h[src]).view(-1, self.num_heads, self.hidden_dim // self.num_heads)
 
-        Args:
-            features: Tuple of scalar and vector features (h, X)
-            index: Index tensor for scatter operation
-            ptr: Pointer tensor for scatter operation
-            dim_size: Dimension size for scatter operation
+        logits = (q * k).sum(-1) / (self.hidden_dim // self.num_heads) ** 0.5
+        logits = logits + self.edge_gate(t_ij)
+        alpha = torch.softmax(logits, dim=0)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        msg = (alpha.unsqueeze(-1) * v).reshape(-1, self.hidden_dim)
+        h_update = scatter(msg, dst, dim=0, dim_size=h.size(0), reduce="sum")
+        h = h + self.out(h_update)
 
-        Returns:
-            Tuple containing:
-                - Aggregated scalar features [num_nodes, 1, hidden_dims]
-                - Aggregated high-degree steerable features [num_nodes, (L_max ** 2) - 1, hidden_dims]
-        """
-        h, X = features
-        h = scatter(h, index, dim=self.node_dim, dim_size=dim_size, reduce=self.aggr)
-        X = scatter(X, index, dim=self.node_dim, dim_size=dim_size, reduce=self.aggr)
-        return h, X
-
-    def update(self, inputs: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
-        """
-        Update node features with aggregated messages.
-
-        This method implements the update step of message passing. In this implementation,
-        it simply passes through the aggregated features without additional processing.
-
-        Args:
-            inputs: Tuple of aggregated scalar and high-degree steerable features
-
-        Returns:
-            Tuple containing:
-                - Updated scalar features [num_nodes, 1, hidden_dims]
-                - Updated high-degree steerable features [num_nodes, (L_max ** 2) - 1, hidden_dims]
-        """
-        return inputs
+        t_upd = self.edge_update(torch.cat([h[src], h[dst], t_ij], dim=-1))
+        t_ij = t_ij + t_upd
+        return h, t_ij
 
 
 class EQFF(nn.Module):
-    """
-    Equivariant Feed-Forward (EQFF) Network for mixing atom features.
-
-    This module facilitates efficient channel-wise interaction while maintaining equivariance.
-    It separates scalar and high-degree steerable features, allowing for specialized processing
-    of each feature type before combining them with non-linear mappings as described in the paper:
-
-    EQFF(h, X^(l)) = (h + m_1, X^(l) + m_2 * (X^(l)W_{vu}))
-    where m_1, m_2 = split_2(gamma_{m}(||X^(l)W_{vu}||_2, h))
-    """
-
-    def __init__(
-        self,
-        n_atom_basis: int,
-        activation: Callable,
-        lmax: int,
-        epsilon: float = 1e-8,
-        weight_init: Callable = nn.init.xavier_uniform_,
-        bias_init: Callable = nn.init.zeros_,
-    ):
-        """
-        Initialize EQFF module.
-
-        Args:
-            n_atom_basis: Number of features to describe atomic environments.
-            activation: Activation function. If None, no activation function is used.
-            lmax: Maximum angular momentum.
-            epsilon: Stability constant added in norm to prevent numerical instabilities.
-            weight_init: Weight initialization function.
-            bias_init: Bias initialization function.
-        """
-        super(EQFF, self).__init__()
-        self.lmax = lmax
-        self.n_atom_basis = n_atom_basis
-        self.epsilon = epsilon
-
-        InitDense = partial(Dense, weight_init=weight_init, bias_init=bias_init)
-
-        context_dim = 2 * n_atom_basis
-        out_size = 2
-
-        # gamma_m implementation
-        self.gamma_m = nn.Sequential(
-            InitDense(context_dim, n_atom_basis, activation=activation),
-            InitDense(n_atom_basis, out_size * n_atom_basis, activation=None),
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
         )
 
-        self.W_vu = InitDense(n_atom_basis, n_atom_basis, activation=None, bias=False)
-
-    def reset_parameters(self):
-        """Reset all learnable parameters of the module."""
-        self.W_vu.reset_parameters()
-        for l in self.gamma_m:
-            l.reset_parameters()
-
     def forward(self, h: Tensor, X: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Compute intraatomic mixing.
+        dh = self.net(h)
+        return h + dh, X
 
-        Args:
-            h: Scalar input values, [num_nodes, 1, hidden_dims].
-            X: High-degree steerable features, [num_nodes, (L_max ** 2) - 1, hidden_dims].
 
-        Returns:
-            Tuple of updated scalar values and high-degree steerable features,
-            each of shape [num_nodes, 1, hidden_dims] and [num_nodes, (L_max ** 2) - 1, hidden_dims].
-        """
-        X_p = self.W_vu(X)
+class EdgeHTR(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
 
-        # Compute norm of X_V with numerical stability
-        X_pn = torch.sqrt(torch.sum(X_p**2, dim=-2, keepdim=True) + self.epsilon)
+    def forward(self, t_e2: Tensor, h: Tensor, edge_index1: Tensor, e1_to_e2: Tensor) -> Tensor:
+        src1, dst1 = edge_index1
+        sub_t = t_e2[e1_to_e2]
+        delta = self.mlp(torch.cat([h[src1], h[dst1], sub_t], dim=-1))
+        t_new = t_e2.clone()
+        t_new[e1_to_e2] = sub_t + delta
+        return t_new
 
-        # Concatenate features for context
-        channel_context = [h, X_pn]
-        ctx = torch.cat(channel_context, dim=-1)
 
-        # Apply gamma_m transformation
-        x = self.gamma_m(ctx)
+class InteractionBlock(nn.Module):
+    def __init__(self, hidden_dim: int, n_rbf: int, lmax: int, num_heads: int, dropout: float, wedge_use_high_degree: bool):
+        super().__init__()
+        self.local2fwl = Local2FWLRefine(hidden_dim, n_rbf, lmax, wedge_use_high_degree=wedge_use_high_degree)
+        self.gata1 = GATA(hidden_dim, num_heads=num_heads, dropout=dropout)
+        self.eqff1 = EQFF(hidden_dim)
+        self.htr = EdgeHTR(hidden_dim)
+        self.gata2 = GATA(hidden_dim, num_heads=num_heads, dropout=dropout)
+        self.eqff2 = EQFF(hidden_dim)
 
-        # Split output into scalar and vector components
-        m1, m2 = torch.split(x, self.n_atom_basis, dim=-1)
-        dX_intra = m2 * X_p
-
-        # Update features with residual connections
-        h = h + m1
-        X = X + dX_intra
-
-        return h, X
+    def forward(
+        self,
+        h: Tensor,
+        X: Tensor,
+        t_e2: Tensor,
+        edge_index1: Tensor,
+        edge_index2: Tensor,
+        e1_to_e2: Tensor,
+        dist_e1: Tensor,
+        dist_e2: Tensor,
+        rbf_e1: Tensor,
+        rbf_e2: Tensor,
+        sph_e1: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        t_e2 = self.local2fwl(t_e2, h, edge_index1, edge_index2, dist_e1, dist_e2, rbf_e1, rbf_e2, sph_e1, h.size(0))
+        h, t_e2 = self.gata1(edge_index2, h, t_e2)
+        h, X = self.eqff1(h, X)
+        t_e2 = self.htr(t_e2, h, edge_index1, e1_to_e2)
+        h, t_e2 = self.gata2(edge_index2, h, t_e2)
+        h, X = self.eqff2(h, X)
+        return h, X, t_e2
 
 
 class GotenNet(nn.Module):
-    """
-    Graph Attention Transformer Network for atomic systems.
-
-    GotenNet processes and updates two types of node features (invariant and steerable)
-    and edge features (invariant) through three main mechanisms:
-
-    1. GATA (Graph Attention Transformer Architecture): A degree-wise attention-based
-       message passing layer that updates both invariant and steerable features while
-       preserving equivariance.
-    2. HTR (Hierarchical Tensor Refinement): Updates edge features across degrees with
-       inner products of steerable features.
-    3. EQFF (Equivariant Feed-Forward): Further processes both types of node features
-       while maintaining equivariance.
-    """
-
     def __init__(
         self,
         n_atom_basis: int = 128,
-        n_interactions: int = 8,
-        radial_basis: Union[Callable, str] = "expnorm",
+        n_interactions: int = 4,
+        radial_basis: Union[str, callable] = "expnorm",
         n_rbf: int = 32,
-        cutoff_fn: Optional[Union[Callable, str]] = None,
-        activation: Optional[Union[Callable, str]] = F.silu,
+        cutoff_fn: Optional[object] = None,
+        activation: Optional[Union[str, callable]] = F.silu,
         max_z: int = 100,
-        epsilon: float = 1e-8,
-        weight_init: Callable = nn.init.xavier_uniform_,
-        bias_init: Callable = nn.init.zeros_,
-        layernorm: str = "",
-        steerable_norm: str = "",
         num_heads: int = 8,
         attn_dropout: float = 0.0,
-        edge_updates: Union[bool, str] = True,
-        scale_edge: bool = True,
-        lmax: int = 1,
-        aggr: str = "add",
-        evec_dim: Optional[int] = None,
-        emlp_dim: Optional[int] = None,
-        sep_htr: bool = True,
-        sep_dir: bool = False,
-        sep_tensor: bool = False,
-        edge_ln: str = "",
+        lmax: int = 2,
+        r2_cutoff: Optional[float] = None,
+        topk2: Optional[int] = None,
+        init_use_e2: bool = False,
+        wedge_use_high_degree: bool = False,
+        **kwargs,
     ):
-        """
-        Initialize GotenNet model.
-
-        Args:
-            n_atom_basis: Number of features to describe atomic environments.
-                This determines the size of each embedding vector; i.e. embeddings_dim.
-            n_interactions: Number of interaction blocks.
-            radial_basis: Layer for expanding interatomic distances in a basis set.
-            n_rbf: Number of radial basis functions.
-            cutoff_fn: Cutoff function.
-            activation: Activation function.
-            max_z: Maximum atomic number.
-            epsilon: Stability constant added in norm to prevent numerical instabilities.
-            weight_init: Weight initialization function.
-            bias_init: Bias initialization function.
-            max_num_neighbors: Maximum number of neighbors.
-            layernorm: Type of layer normalization to use.
-            steerable_norm: Type of steerable normalization to use.
-            num_heads: Number of attention heads.
-            attn_dropout: Dropout probability for attention.
-            edge_updates: Whether to update edge features.
-            scale_edge: Whether to scale edge features.
-            lmax: Maximum angular momentum.
-            aggr: Aggregation method ('add', 'mean' or 'max').
-            evec_dim: Dimension of edge vector features.
-            emlp_dim: Dimension of edge MLP features.
-            sep_htr: Whether to separate vector features in interaction.
-            sep_dir: Whether to separate direction features.
-            sep_tensor: Whether to separate tensor features.
-        """
-        super(GotenNet, self).__init__()
-
-        self.scale_edge = scale_edge
-        if type(weight_init) == str:
-            weight_init = get_weight_init_by_string(weight_init)
-
-        if type(bias_init) == str:
-            bias_init = get_weight_init_by_string(bias_init)
-
-        if type(activation) is str:
+        super().__init__()
+        if isinstance(activation, str):
             activation = str2act(activation)
-
-        self.n_atom_basis = self.hidden_dim = n_atom_basis
+        self.n_atom_basis = n_atom_basis
         self.n_interactions = n_interactions
-        self.cutoff_fn = cutoff_fn
-        self.cutoff = cutoff_fn.cutoff
         self.lmax = lmax
+        self.cutoff = cutoff_fn.cutoff if cutoff_fn is not None else 5.0
+        self.r2_cutoff = r2_cutoff if r2_cutoff is not None else self.cutoff
+        self.topk2 = topk2
+        self.init_use_e2 = init_use_e2
+        self.wedge_use_high_degree = wedge_use_high_degree
 
-        self.node_init = NodeInit(
-            [self.hidden_dim, self.hidden_dim],
-            n_rbf,
-            self.cutoff,
-            max_z=max_z,
-            weight_init=weight_init,
-            bias_init=bias_init,
-            proj_ln="layer",
-            activation=activation,
-        )
+        self.node_init = NodeInit([n_atom_basis, n_atom_basis], n_rbf, self.cutoff, max_z=max_z, activation=activation)
+        self.edge_init = EdgeInit(n_rbf, n_atom_basis)
+        self.W_erp_2hop = nn.Linear(n_rbf, n_atom_basis)
 
-        self.edge_init = EdgeInit(n_rbf, self.hidden_dim)
+        rb = str2basis(radial_basis)
+        self.radial_basis = rb(cutoff=max(self.cutoff, self.r2_cutoff), n_rbf=n_rbf)
+        self.varphi1 = CosineCutoff(self.cutoff)
+        self.varphi2 = CosineCutoff(self.r2_cutoff)
 
-        radial_basis = str2basis(radial_basis)
-        self.radial_basis = radial_basis(cutoff=self.cutoff, n_rbf=n_rbf)
         self.A_na = nn.Embedding(max_z, n_atom_basis, padding_idx=0)
         self.sh_irreps = e3nn.o3.Irreps.spherical_harmonics(lmax)
         self.sphere = e3nn.o3.SphericalHarmonics(self.sh_irreps, normalize=False, normalization="norm")
 
-        self.gata_list = nn.ModuleList(
-            [
-                GATA(
-                    n_atom_basis=self.n_atom_basis,
-                    activation=activation,
-                    aggr=aggr,
-                    weight_init=weight_init,
-                    bias_init=bias_init,
-                    layer_norm=layernorm,
-                    steerable_norm=steerable_norm,
-                    cutoff=self.cutoff,
-                    epsilon=epsilon,
-                    num_heads=num_heads,
-                    dropout=attn_dropout,
-                    edge_updates=edge_updates,
-                    last_layer=(i == self.n_interactions - 1),
-                    scale_edge=scale_edge,
-                    evec_dim=evec_dim,
-                    emlp_dim=emlp_dim,
-                    sep_htr=sep_htr,
-                    sep_dir=sep_dir,
-                    sep_tensor=sep_tensor,
-                    lmax=lmax,
-                    edge_ln=edge_ln,
-                )
-                for i in range(self.n_interactions)
-            ]
-        )
-
-        self.eqff_list = nn.ModuleList(
-            [
-                EQFF(
-                    n_atom_basis=self.n_atom_basis,
-                    activation=activation,
-                    lmax=lmax,
-                    epsilon=epsilon,
-                    weight_init=weight_init,
-                    bias_init=bias_init,
-                )
-                for i in range(self.n_interactions)
-            ]
-        )
-
-        self.reset_parameters()
-
-    @classmethod
-    def load_from_checkpoint(cls, checkpoint_path: str, device="cpu") -> None:
-        """
-        Load model parameters from a checkpoint.
-
-        Args:
-            checkpoint: Dictionary containing model parameters.
-        """
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(
-                f"Checkpoint file {checkpoint_path} does not exist."
-            )
-
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-
-        if "representation" in checkpoint:
-            checkpoint = checkpoint["representation"]
-
-        assert "hyper_parameters" in checkpoint, (
-            "Checkpoint must contain 'hyper_parameters' key."
-        )
-        hyper_parameters = checkpoint["hyper_parameters"]
-        assert "representation" in hyper_parameters, (
-            "Hyperparameters must contain 'representation' key."
-        )
-        representation_config = hyper_parameters["representation"]
-        _ = representation_config.pop("_target_", None)
-
-        assert "state_dict" in checkpoint, "Checkpoint must contain 'state_dict' key."
-        original_state_dict = checkpoint["state_dict"]
-        new_state_dict = {}
-        for k, v in original_state_dict.items():
-            if k.startswith("output_modules."):  # Skip output modules
-                continue
-            if k.startswith("representation."):
-                new_k = k.replace("representation.", "")
-                new_state_dict[new_k] = v
-            else:
-                new_state_dict[k] = v
-
-        gotennet = cls(**representation_config)
-        gotennet.load_state_dict(new_state_dict, strict=True)
-        return gotennet
-
-    def reset_parameters(self):
-        self.node_init.reset_parameters()
-        self.edge_init.reset_parameters()
-        for l in self.gata_list:
-            l.reset_parameters()
-        for l in self.eqff_list:
-            l.reset_parameters()
+        self.blocks = nn.ModuleList([
+            InteractionBlock(n_atom_basis, n_rbf, lmax, num_heads, attn_dropout, wedge_use_high_degree)
+            for _ in range(n_interactions)
+        ])
 
     def forward(
-        self, atomic_numbers, edge_index, edge_diff, edge_vec
+        self,
+        atomic_numbers: Tensor,
+        edge_index: Tensor,
+        edge_diff: Tensor,
+        edge_vec: Tensor,
+        pos: Optional[Tensor] = None,
+        batch: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
-        """
-        Compute atomic representations/embeddings.
+        num_nodes = atomic_numbers.size(0)
+        h0 = self.A_na(atomic_numbers)
+        rbf_e1 = self.radial_basis(edge_diff)
+        h = self.node_init(atomic_numbers, h0, edge_index, edge_diff, rbf_e1)
 
-        Args:
-            atomic_numbers: Tensor of atomic numbers [num_nodes]
-            edge_index: Tensor describing graph connectivity [2, num_edges]
-            edge_diff: Tensor of edge distances [num_edges, 1]
-            edge_vec: Tensor of edge direction vectors [num_edges, 3]
-
-        Returns:
-            Tuple containing:
-                - Atomic representation [num_nodes, hidden_dims]
-                - High-degree steerable features [num_nodes, (L_max ** 2) - 1, hidden_dims]
-        """
-        h = self.A_na(atomic_numbers)[:]
-        phi_r0_ij = self.radial_basis(edge_diff)
-
-        h = self.node_init(atomic_numbers, h, edge_index, edge_diff, phi_r0_ij)
-        t_ij_init = self.edge_init(edge_index, phi_r0_ij, h)
-        mask = edge_index[0] != edge_index[1]
-        r0_ij = torch.norm(edge_vec[mask], dim=1).unsqueeze(1)
-        edge_vec[mask] = edge_vec[mask] / r0_ij
-
-        rl_ij = self.sphere(edge_vec)[:, 1:]
-
-        equi_dim = ((self.lmax + 1) ** 2) - 1
-        # count number of edges for each node
-        num_edges = scatter(
-            torch.ones_like(edge_diff), edge_index[0], dim=0, reduce="sum"
+        edge_index2, edge_type2, e1_to_e2 = build_two_hop_edges(
+            edge_index, num_nodes=num_nodes, batch=batch, pos=pos, r2=self.r2_cutoff, topk2=self.topk2
         )
-        n_edges = num_edges[edge_index[0]]
 
-        hs = h.shape
-        X = torch.zeros((hs[0], equi_dim, hs[1]), device=h.device)
-        h.unsqueeze_(1)
-        t_ij = t_ij_init
-        for _i, (gata, eqff) in enumerate(
-            zip(self.gata_list, self.eqff_list, strict=False)
-        ):
-            h, X, t_ij = gata(
-                edge_index,
+        if pos is not None:
+            edge_vec2 = pos[edge_index2[0]] - pos[edge_index2[1]]
+            dist_e2 = torch.norm(edge_vec2, dim=-1)
+            safe = dist_e2 > 0
+            edge_vec2 = edge_vec2.clone()
+            edge_vec2[safe] = edge_vec2[safe] / dist_e2[safe].unsqueeze(-1)
+        else:
+            dist_e2 = edge_diff[e1_to_e2]
+            edge_vec2 = edge_vec[e1_to_e2]
+
+        rbf_e2 = self.radial_basis(dist_e2)
+        env = torch.where(edge_type2 == 0, self.varphi1(dist_e2), self.varphi2(dist_e2)).unsqueeze(-1)
+
+        t1 = (h[edge_index2[0]] + h[edge_index2[1]]) * self.edge_init.W_erp(rbf_e2)
+        t2 = (h[edge_index2[0]] + h[edge_index2[1]]) * self.W_erp_2hop(rbf_e2)
+        t_e2 = torch.where(edge_type2.unsqueeze(-1) == 0, t1, t2) * env
+
+        sph_e1 = self.sphere(edge_vec)[:, 1:]
+        sph_e2 = self.sphere(edge_vec2)[:, 1:]
+
+        eq_dim = ((self.lmax + 1) ** 2) - 1
+        X = torch.zeros((num_nodes, eq_dim, self.n_atom_basis), device=h.device)
+        init_edges = edge_index2 if self.init_use_e2 else edge_index
+        init_sph = sph_e2 if self.init_use_e2 else sph_e1
+        msg = init_sph.unsqueeze(-1) * h[init_edges[1]].unsqueeze(1)
+        X = X + scatter(msg, init_edges[0], dim=0, dim_size=num_nodes, reduce="sum")
+
+        for block in self.blocks:
+            h, X, t_e2 = block(
                 h,
                 X,
-                rl_ij=rl_ij,
-                t_ij=t_ij,
-                r_ij=edge_diff,
-                n_edges=n_edges,
-            )  # idx_i, idx_j, n_atoms, # , f_ij=f_ij
-            h, X = eqff(h, X)
+                t_e2,
+                edge_index,
+                edge_index2,
+                e1_to_e2,
+                edge_diff,
+                dist_e2,
+                rbf_e1,
+                rbf_e2,
+                sph_e1,
+            )
 
-        h = h.squeeze(1)
         return h, X
 
 
 class GotenNetWrapper(GotenNet):
-    """
-    The wrapper around GotenNet for processing atomistic data.
-    """
-
-    def __init__(self, *args, max_num_neighbors=32, **kwargs):
-        super(GotenNetWrapper, self).__init__(*args, **kwargs)
-
-        self.distance = Distance(
-            self.cutoff, max_num_neighbors=max_num_neighbors, loop=True
-        )
-        self.reset_parameters()
+    def __init__(self, *args, max_num_neighbors: int = 32, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.distance = Distance(self.cutoff, max_num_neighbors=max_num_neighbors, loop=True)
 
     def forward(self, inputs: Mapping[str, Tensor]) -> Tuple[Tensor, Tensor]:
-        """
-        Compute atomic representations/embeddings.
-
-        Args:
-            inputs: Dictionary of input tensors containing atomic_numbers, pos, batch,
-                edge_index, r_ij, and dir_ij. Shape information:
-                - atomic_numbers: [num_nodes]
-                - pos: [num_nodes, 3]
-                - batch: [num_nodes]
-                - edge_index: [2, num_edges]
-
-        Returns:
-            Tuple containing:
-                - Atomic representation [num_nodes, hidden_dims]
-                - High-degree steerable features [num_nodes, (L_max ** 2) - 1, hidden_dims]
-        """
         atomic_numbers, pos, batch = inputs.z, inputs.pos, inputs.batch
         edge_index, edge_diff, edge_vec = self.distance(pos, batch)
-        return super().forward(atomic_numbers, edge_index, edge_diff, edge_vec)
+        return super().forward(atomic_numbers, edge_index, edge_diff, edge_vec, pos=pos, batch=batch)

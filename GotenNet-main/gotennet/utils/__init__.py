@@ -3,7 +3,10 @@ import warnings
 from typing import Sequence
 
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.utilities import rank_zero_only
+
+
+def rank_zero_only(fn):
+    return fn
 
 
 def humanbytes(B):
@@ -34,9 +37,6 @@ def humanbytes(B):
         return "{0:.2f} TB".format(B / TB)
 
 
-from gotennet.utils.logging_utils import log_hyperparameters as log_hyperparameters
-from gotennet.utils.utils import get_metric_value as get_metric_value
-from gotennet.utils.utils import task_wrapper as task_wrapper
 
 
 def get_logger(name=__name__) -> logging.Logger:
@@ -69,6 +69,19 @@ def get_logger(name=__name__) -> logging.Logger:
 
 
 log = get_logger(__name__)
+
+
+def log_hyperparameters(*args, **kwargs):
+    return None
+
+
+def get_metric_value(*args, **kwargs):
+    return None
+
+
+def task_wrapper(fn):
+    return fn
+
 
 
 def extras(config: DictConfig) -> None:
