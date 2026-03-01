@@ -27,7 +27,9 @@ def build_two_hop_edges(
     pos: Optional[Tensor] = None,
     r2: Optional[float] = None,
     topk2: Optional[int] = None,
-) -> Tuple[Tensor, Tensor, Tensor]:
+    skip_r2_pruning: bool = False,
+    max_edges_e2: int = -1,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     src1, dst1 = edge_index1
     device = edge_index1.device
     key_base = num_nodes
@@ -60,6 +62,8 @@ def build_two_hop_edges(
 
     if extra_pairs:
         extra = torch.cat(extra_pairs, dim=1)
+        if skip_r2_pruning:
+            extra = torch.cat([extra, extra.flip(0)], dim=1)
         e2 = torch.cat([edge_index1, extra], dim=1)
     else:
         e2 = edge_index1.clone()
@@ -81,8 +85,9 @@ def build_two_hop_edges(
     if pos is not None and (r2 is not None or topk2 is not None):
         d2 = torch.norm(pos[edge_index2[0]] - pos[edge_index2[1]], dim=-1)
         keep = torch.ones_like(d2, dtype=torch.bool)
-        if r2 is not None:
-            keep &= d2 <= r2
+        is_e1_edge = torch.isin(uniq_keys, e1_keys)
+        if (not skip_r2_pruning) and (r2 is not None):
+            keep &= (d2 <= r2) | is_e1_edge
         if topk2 is not None:
             keep_topk = torch.zeros_like(keep)
             for i in range(num_nodes):
@@ -96,20 +101,76 @@ def build_two_hop_edges(
                 k = min(topk2, idx.numel())
                 top_idx = torch.topk(d, k=k, largest=False).indices
                 keep_topk[idx[top_idx]] = True
+            keep_topk |= is_e1_edge
             keep &= keep_topk
         edge_index2 = edge_index2[:, keep]
         uniq_keys = uniq_keys[keep]
 
+    if skip_r2_pruning and max_edges_e2 > 0 and edge_index2.size(1) > max_edges_e2:
+        if pos is None or r2 is None:
+            raise RuntimeError("skip_r2_pruning fallback requires `pos` and `r2`.")
+        d2 = torch.norm(pos[edge_index2[0]] - pos[edge_index2[1]], dim=-1)
+        keep = d2 <= r2
+        edge_index2 = edge_index2[:, keep]
+        uniq_keys = uniq_keys[keep]
+        print(f"[Goten2FWL warn] E2 exceeded max_edges_e2={max_edges_e2}; fell back to r2-pruned E2.")
+
     e1_keys_sorted = src1 * key_base + dst1
     pos_in_e2 = torch.searchsorted(uniq_keys, e1_keys_sorted)
-    valid = (pos_in_e2 < uniq_keys.numel()) & (uniq_keys[pos_in_e2] == e1_keys_sorted)
+    valid = pos_in_e2 < uniq_keys.numel()
+    valid_match = torch.zeros_like(valid)
+    valid_match[valid] = uniq_keys[pos_in_e2[valid]] == e1_keys_sorted[valid]
+    valid = valid & valid_match
     e1_to_e2 = pos_in_e2
     if not bool(valid.all()):
         raise RuntimeError("Failed to align E1 edges in E2.")
 
     edge_type2 = torch.ones(edge_index2.size(1), device=device, dtype=torch.long)
     edge_type2[e1_to_e2] = 0
-    return edge_index2, edge_type2, e1_to_e2
+    if pos is not None and r2 is not None:
+        d2 = torch.norm(pos[edge_index2[0]] - pos[edge_index2[1]], dim=-1)
+        far_pair_mask = d2 > r2
+    else:
+        far_pair_mask = torch.zeros(edge_index2.size(1), device=device, dtype=torch.bool)
+    return edge_index2, edge_type2, e1_to_e2, far_pair_mask
+
+
+def count_wedges(edge_index1: Tensor, edge_index2: Tensor, far_pair_mask: Tensor, num_nodes: int) -> Tuple[int, int]:
+    src1, dst1 = edge_index1
+    src2, dst2 = edge_index2
+    key_base = num_nodes
+    e2_keys = src2 * key_base + dst2
+    far_lookup = torch.zeros(edge_index2.size(1), dtype=torch.bool, device=edge_index2.device)
+    far_lookup[:] = far_pair_mask
+
+    incoming = [[] for _ in range(num_nodes)]
+    outgoing = [[] for _ in range(num_nodes)]
+    for eid in range(src1.numel()):
+        i = int(src1[eid])
+        j = int(dst1[eid])
+        if i == j:
+            continue
+        outgoing[i].append(j)
+        incoming[j].append(i)
+
+    n_wedges = 0
+    n_wedges_far = 0
+    for k in range(num_nodes):
+        in_nodes = incoming[k]
+        out_nodes = outgoing[k]
+        if not in_nodes or not out_nodes:
+            continue
+        for i in in_nodes:
+            for j in out_nodes:
+                if i == j:
+                    continue
+                pair_key = i * key_base + j
+                eij = torch.searchsorted(e2_keys, torch.tensor([pair_key], device=edge_index2.device, dtype=torch.long))
+                eij = int(eij.item())
+                if eij < e2_keys.numel() and int(e2_keys[eij]) == pair_key:
+                    n_wedges += 1
+                    n_wedges_far += int(far_lookup[eij].item())
+    return n_wedges, n_wedges_far
 
 
 class Local2FWLRefine(nn.Module):
@@ -131,6 +192,7 @@ class Local2FWLRefine(nn.Module):
         h: Tensor,
         edge_index1: Tensor,
         edge_index2: Tensor,
+        e1_to_e2: Tensor,
         dist_e1: Tensor,
         dist_e2: Tensor,
         rbf_e1: Tensor,
@@ -211,7 +273,7 @@ class Local2FWLRefine(nn.Module):
 
         g = torch.cat([rbf_e1[eik], rbf_e1[ekj], rbf_e2[eij], c_feat], dim=-1)
         rho_in = torch.cat(
-            [t_e2[eik], t_e2[ekj], t_e2[eij], h[i], h[k], h[j], g],
+            [t_e2[e1_to_e2[eik]], t_e2[e1_to_e2[ekj]], t_e2[eij], h[i], h[k], h[j], g],
             dim=-1,
         )
         wedge_msg = self.rho(rho_in)
@@ -296,6 +358,8 @@ class InteractionBlock(nn.Module):
         t_e2: Tensor,
         edge_index1: Tensor,
         edge_index2: Tensor,
+        gata_edge_index: Tensor,
+        gata_to_e2: Tensor,
         e1_to_e2: Tensor,
         dist_e1: Tensor,
         dist_e2: Tensor,
@@ -303,11 +367,15 @@ class InteractionBlock(nn.Module):
         rbf_e2: Tensor,
         sph_e1: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        t_e2 = self.local2fwl(t_e2, h, edge_index1, edge_index2, dist_e1, dist_e2, rbf_e1, rbf_e2, sph_e1, h.size(0))
-        h, t_e2 = self.gata1(edge_index2, h, t_e2)
+        t_e2 = self.local2fwl(t_e2, h, edge_index1, edge_index2, e1_to_e2, dist_e1, dist_e2, rbf_e1, rbf_e2, sph_e1, h.size(0))
+        h, gata_t = self.gata1(gata_edge_index, h, t_e2[gata_to_e2])
+        t_e2 = t_e2.clone()
+        t_e2[gata_to_e2] = gata_t
         h, X = self.eqff1(h, X)
         t_e2 = self.htr(t_e2, h, edge_index1, e1_to_e2)
-        h, t_e2 = self.gata2(edge_index2, h, t_e2)
+        h, gata_t = self.gata2(gata_edge_index, h, t_e2[gata_to_e2])
+        t_e2 = t_e2.clone()
+        t_e2[gata_to_e2] = gata_t
         h, X = self.eqff2(h, X)
         return h, X, t_e2
 
@@ -329,6 +397,11 @@ class GotenNet(nn.Module):
         topk2: Optional[int] = None,
         init_use_e2: bool = False,
         wedge_use_high_degree: bool = False,
+        skip_r2_pruning: bool = False,
+        far_pair_mode: str = "2fwl_only",
+        max_edges_e2: int = -1,
+        debug_2hop: bool = False,
+        r_rbf_max: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
@@ -342,6 +415,13 @@ class GotenNet(nn.Module):
         self.topk2 = topk2
         self.init_use_e2 = init_use_e2
         self.wedge_use_high_degree = wedge_use_high_degree
+        self.skip_r2_pruning = skip_r2_pruning
+        self.far_pair_mode = far_pair_mode
+        if self.far_pair_mode not in {"2fwl_only", "no_envelope", "extended"}:
+            raise ValueError("far_pair_mode must be one of ['2fwl_only', 'no_envelope', 'extended']")
+        self.max_edges_e2 = max_edges_e2
+        self.debug_2hop = debug_2hop
+        self._debug_printed = False
 
         self.node_init = NodeInit([n_atom_basis, n_atom_basis], n_rbf, self.cutoff, max_z=max_z, activation=activation)
         self.edge_init = EdgeInit(n_rbf, n_atom_basis)
@@ -349,8 +429,11 @@ class GotenNet(nn.Module):
 
         rb = str2basis(radial_basis)
         self.radial_basis = rb(cutoff=max(self.cutoff, self.r2_cutoff), n_rbf=n_rbf)
+        self.r_rbf_max = r_rbf_max if r_rbf_max is not None else max(2 * self.cutoff, self.r2_cutoff)
+        self.radial_basis_e2 = rb(cutoff=max(self.r_rbf_max, self.r2_cutoff), n_rbf=n_rbf)
         self.varphi1 = CosineCutoff(self.cutoff)
         self.varphi2 = CosineCutoff(self.r2_cutoff)
+        self.varphi3 = CosineCutoff(self.r_rbf_max)
 
         self.A_na = nn.Embedding(max_z, n_atom_basis, padding_idx=0)
         self.sh_irreps = e3nn.o3.Irreps.spherical_harmonics(lmax)
@@ -375,8 +458,15 @@ class GotenNet(nn.Module):
         rbf_e1 = self.radial_basis(edge_diff)
         h = self.node_init(atomic_numbers, h0, edge_index, edge_diff, rbf_e1)
 
-        edge_index2, edge_type2, e1_to_e2 = build_two_hop_edges(
-            edge_index, num_nodes=num_nodes, batch=batch, pos=pos, r2=self.r2_cutoff, topk2=self.topk2
+        edge_index2, edge_type2, e1_to_e2, far_pair_mask = build_two_hop_edges(
+            edge_index,
+            num_nodes=num_nodes,
+            batch=batch,
+            pos=pos,
+            r2=self.r2_cutoff,
+            topk2=self.topk2,
+            skip_r2_pruning=self.skip_r2_pruning,
+            max_edges_e2=self.max_edges_e2,
         )
 
         if pos is not None:
@@ -389,8 +479,17 @@ class GotenNet(nn.Module):
             dist_e2 = edge_diff[e1_to_e2]
             edge_vec2 = edge_vec[e1_to_e2]
 
-        rbf_e2 = self.radial_basis(dist_e2)
-        env = torch.where(edge_type2 == 0, self.varphi1(dist_e2), self.varphi2(dist_e2)).unsqueeze(-1)
+        rbf_e2 = self.radial_basis_e2(dist_e2) if self.skip_r2_pruning else self.radial_basis(dist_e2)
+        env = torch.where(edge_type2 == 0, self.varphi1(dist_e2), self.varphi2(dist_e2))
+        if self.far_pair_mode == "no_envelope":
+            env = torch.where(far_pair_mask, torch.ones_like(env), env)
+        elif self.far_pair_mode == "extended":
+            env = torch.where(far_pair_mask, self.varphi3(dist_e2), env)
+        env = env.unsqueeze(-1)
+
+        gata_keep = ~far_pair_mask if self.far_pair_mode == "2fwl_only" else torch.ones_like(far_pair_mask)
+        gata_edge_index = edge_index2[:, gata_keep]
+        gata_to_e2 = torch.where(gata_keep)[0]
 
         t1 = (h[edge_index2[0]] + h[edge_index2[1]]) * self.edge_init.W_erp(rbf_e2)
         t2 = (h[edge_index2[0]] + h[edge_index2[1]]) * self.W_erp_2hop(rbf_e2)
@@ -413,6 +512,8 @@ class GotenNet(nn.Module):
                 t_e2,
                 edge_index,
                 edge_index2,
+                gata_edge_index,
+                gata_to_e2,
                 e1_to_e2,
                 edge_diff,
                 dist_e2,
@@ -420,6 +521,19 @@ class GotenNet(nn.Module):
                 rbf_e2,
                 sph_e1,
             )
+
+        if self.debug_2hop and not self._debug_printed:
+            n_e1 = edge_index.size(1)
+            n_e2 = edge_index2.size(1)
+            n_e2_only = int((edge_type2 == 1).sum().item())
+            n_far = int((far_pair_mask & (edge_type2 == 1)).sum().item())
+            print(f"[Goten2FWL debug] |E1|={n_e1}, |E2|={n_e2} ({(n_e2 / max(n_e1, 1)):.1f}x), |E2_only|={n_e2_only}")
+            print(f"[Goten2FWL debug] Far pairs (d>r2): {n_far} of {n_e2_only} E2-only edges")
+            n_wedges, n_wedges_far = count_wedges(edge_index, edge_index2, far_pair_mask, num_nodes)
+            print(f"[Goten2FWL debug] Wedges: {n_wedges} total, {n_wedges_far} target far pairs")
+            included_or_excluded = "excluded" if self.far_pair_mode == "2fwl_only" else "included"
+            print(f"[Goten2FWL debug] far_pair_mode={self.far_pair_mode}: {n_far} pairs {included_or_excluded} from GATA")
+            self._debug_printed = True
 
         return h, X
 
