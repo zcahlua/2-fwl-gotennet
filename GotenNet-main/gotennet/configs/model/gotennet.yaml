@@ -30,6 +30,10 @@ representation:
   attn_dropout: 0.1
   edge_updates: True
   lmax: 2
+  skip_r2_pruning: False
+  far_pair_mode: "2fwl_only"
+  max_edges_e2: -1
+  debug_2hop: False
   aggr: "add"
   scale_edge: False
   evec_dim:
